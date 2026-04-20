@@ -1,5 +1,7 @@
 import logging
 import os
+import re
+import shutil
 import warnings
 
 import torch
@@ -12,6 +14,7 @@ except ImportError:
     from torch.distributed._tensor import DTensor
 
 from verl.models.transformers.monkey_patch import apply_monkey_patch
+from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.device import (
     get_device_id,
@@ -19,9 +22,9 @@ from verl.utils.device import (
 )
 from verl.utils.fsdp_utils import (
     collect_lora_params,
-    get_init_weight_context_manager,
     load_fsdp_model_to_gpu,
     offload_fsdp_model_to_cpu,
+    offload_fsdp_optimizer,
     replace_lora_wrapper,
 )
 from verl.utils.memory_utils import aggressive_empty_cache
@@ -47,6 +50,7 @@ def move_buffers_to_device_recursive(model, device):
 class MMActorRolloutRefWorker(ActorRolloutRefWorker):
     def __init__(self, config: DictConfig, role: str, **kwargs):
         super().__init__(config, role, **kwargs)
+        self.trainer = None
 
     def _dataloader(self, args=None):
         return None
@@ -116,14 +120,22 @@ class MMActorRolloutRefWorker(ActorRolloutRefWorker):
 
         set_expandable_segments(False)
 
-        if peft_config is not None and self.base_sync_done:
-            per_tensor_param = params.items() if isinstance(params, dict) else params  # Fixed: handle dict case
-        else:
-            device = get_device_id()  # used when fsdp2 set cpu_offload_policy
-            per_tensor_param = (
-                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
-                for name, param in params.items()
+        # Ensure all params are on GPU before sending to rollout engine.
+        # collect_lora_params returns CPU tensors via .detach().cpu(), so the
+        # previous base_sync_done fast-path silently passed CPU tensors through,
+        # which could cause errors in backends that expect GPU tensors (e.g.
+        # SGLang's CUDA IPC serializer).
+        device = get_device_id()
+        _items = params.items() if isinstance(params, dict) else params
+        per_tensor_param = (
+            (
+                name,
+                param.to(device, non_blocking=True).full_tensor()
+                if isinstance(param, DTensor)
+                else param.to(device, non_blocking=False),
             )
+            for name, param in _items
+        )
 
         # QAT: quantize weights before sending to vLLM
         if self._qat_enabled:
@@ -270,11 +282,7 @@ class MMActorRolloutRefWorker(ActorRolloutRefWorker):
         if self.rank == 0:
             print(f"Model config after override: {actor_model_config}")
 
-        init_context = get_init_weight_context_manager(
-            use_meta_tensor=not actor_model_config.tie_word_embeddings, mesh=self.device_mesh
-        )
-
-        with init_context(), warnings.catch_warnings():
+        with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             from mindspeed_mm.fsdp.train.trainer import Trainer
 
@@ -289,6 +297,7 @@ class MMActorRolloutRefWorker(ActorRolloutRefWorker):
             trainer = Trainer(args=self.mm_args, dataloader_provider=self._dataloader)
             trainer.train_dataloader = None
             actor_module = trainer.model
+            self.trainer = trainer
 
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
@@ -349,6 +358,108 @@ class MMActorRolloutRefWorker(ActorRolloutRefWorker):
             actor_lr_scheduler = None
 
         return actor_module_fsdp, actor_optimizer, actor_lr_scheduler, actor_model_config
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        super().init_model()
+        from mindspeed_mm.fsdp.optimizer.clip_grad_norm import clip_grad_norm
+
+        def _optimizer_step():
+            grad_norm = clip_grad_norm(
+                self.trainer.model,
+                max_norm=self.mm_args.training.clip_grad,
+                foreach=self.mm_args.training.clip_grad_foreach,
+            )
+            # Update parameters
+            if self._is_actor:
+                self.trainer.optimizer.step()
+            return grad_norm
+
+        if self._is_actor:
+            self.actor._optimizer_step = _optimizer_step
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
+        assert self._is_actor, "only support save checkpoint for actor"
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        state = {
+            "model": self.actor_module_fsdp,
+            "extra_state": {
+                "iteration": global_step,
+                "consumed_train_samples": 0,
+                "lr_scheduler": self.actor_lr_scheduler.state_dict(),
+            },
+        }
+        if not self.mm_args.training.no_save_optim:
+            state["optimizer"] = self.actor_optimizer
+        if not self.mm_args.training.no_save_rng:
+            state["extra_state"]["torch_rng_state"] = torch.get_rng_state()
+
+        self.trainer.checkpointer.save(
+            path=local_path,
+            state=state,
+            iteration=global_step,
+            save_async=self.mm_args.training.save_async,
+        )
+
+        if max_ckpt_to_keep is not None:
+            self._cleanup_old_checkpoints(local_path, max_ckpt_to_keep)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
+        assert self._is_actor or (not self._is_actor and self._is_rollout)
+
+        if local_path is None:
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            if self._is_offload_optimizer:
+                offload_fsdp_optimizer(self.actor_optimizer)
+            return
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        state = {"model": self.actor_module_fsdp, "extra_state": {}}
+        if not self.mm_args.training.no_load_optim:
+            state["optimizer"] = self.actor_optimizer
+
+        release = self.trainer.checkpointer.load(
+            path=local_path,
+            state=state,
+            load_rank0_and_broadcast=self.mm_args.training.load_rank0_and_broadcast,
+            load_strict=self.mm_args.training.load_strict,
+        )
+
+        if not release and "extra_state" in state:
+            if "lr_scheduler" in state["extra_state"]:
+                self.actor_lr_scheduler.load_state_dict(state["extra_state"]["lr_scheduler"])
+            if not self.mm_args.training.no_load_rng and "torch_rng_state" in state["extra_state"]:
+                torch.set_rng_state(state["extra_state"]["torch_rng_state"])
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(self.actor_optimizer)
+
+    def _cleanup_old_checkpoints(self, base_path, max_to_keep):
+        iter_pattern = re.compile(r"iter_(\d+)")
+        iter_dirs = []
+        for name in os.listdir(base_path):
+            match = iter_pattern.match(name)
+            if match:
+                iter_dirs.append((int(match.group(1)), os.path.join(base_path, name)))
+
+        iter_dirs.sort(key=lambda x: x[0])
+        while len(iter_dirs) > max_to_keep:
+            _, old_dir = iter_dirs.pop(0)
+            if os.path.isdir(old_dir):
+                shutil.rmtree(old_dir)
 
 
 class AsyncMMActorRolloutRefWorker(AsyncActorRolloutRefWorker, MMActorRolloutRefWorker):

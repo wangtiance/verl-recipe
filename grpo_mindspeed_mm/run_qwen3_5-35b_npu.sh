@@ -19,7 +19,7 @@ export MM_CONFIG_FILE=./examples/qwen3_5_35B_config.yaml
 start_time=$(date +%Y%m%d)_$(date +%H%M%S)
 
 mkdir -p logs
-python3 -m verl.trainer.main_ppo \
+python3 -m recipe.grpo_mindspeed_mm.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \

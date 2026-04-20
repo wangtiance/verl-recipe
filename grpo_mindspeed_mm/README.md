@@ -77,7 +77,7 @@ https://huggingface.co/Qwen/Qwen3.5-27B
 
 The downloaded model is in the huggingface format and needs to be converted to the dcp format for training. For details, see the following section. 
 
-### convert HF weight to DCP weight ###
+### 2.1 convert HF weight to DCP weight ###
 
 Run the following script to convert the weight:
 
@@ -92,6 +92,26 @@ mm-convert Qwen35Converter hf_to_dcp \
 # ———— xxxxxxx
 #   |—— release
 #   |—— latest_checkpointed_iteration.txt
+```
+
+### 2.2 DCP conversion to HF ###
+
+Currently, the format for saving the mm backend training is dcp. To convert the format to huggingface, perform the following operations:
+
+
+```shell
+cd MindSpeed-MM
+
+# Structure：
+# ———— xxxxxxx
+#   |—— release
+#   |—— latest_checkpointed_iteration.txt
+
+mm-convert Qwen35Converter dcp_to_hf \
+--save_hf_dir ckpt/save_hf_path/Qwen3.5-xxB-hf-save \
+--dcp_dir ckpt/dcp_path/xxxxxxx/release \
+--origin_hf_dir ckpt/hf_path/Qwen3.5-xxB \
+--to_bf16 False
 ```
 
 
@@ -118,6 +138,6 @@ Modify the following parameters and run the script to generate the args file for
 
 ```shell
 # source /usr/local/Ascend/cann/set_env.sh
-# cd verl
-bash recipe/grpo_mindspeed_mm/run_qwen3_5-27b_npu.sh
+# cd verl/recipe/grpo_mindspeed_mm
+bash run_qwen3_5-27b_npu.sh
 ```
